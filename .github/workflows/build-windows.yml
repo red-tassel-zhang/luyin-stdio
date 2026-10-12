@@ -9,6 +9,11 @@ on:
 permissions:
   contents: write
 
+# runner 上 Python 的默认 stdout 编码是 cp1252，脚本里的中文会触发 UnicodeEncodeError
+env:
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: "1"
+
 jobs:
   build:
     runs-on: windows-latest

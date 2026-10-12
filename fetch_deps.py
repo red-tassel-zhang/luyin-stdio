@@ -19,6 +19,12 @@ import urllib.parse
 import urllib.request
 import zipfile
 
+for _stream in (sys.stdout, sys.stderr):
+    try:    # Windows 控制台与 CI runner 的默认编码不一定是 UTF-8，直接 print 中文会崩
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 VENDOR = os.path.join(HERE, "vendor")
 UA = "pip/24.0"

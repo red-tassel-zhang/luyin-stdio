@@ -208,4 +208,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    for _stream in (sys.stdout, sys.stderr):
+        try:    # windowed 打包后没有控制台，这里可能是 None；编码也未必是 UTF-8
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     sys.exit(main())
