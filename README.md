@@ -5,6 +5,8 @@
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078d4.svg">
   <img alt="python" src="https://img.shields.io/badge/python-3.10%2B-ffd343.svg">
   <img alt="GUI" src="https://img.shields.io/badge/GUI-PySide6%20%2F%20Qt6-41cd52.svg">
+  <a href="https://github.com/red-tassel-zhang/luyin-stdio/actions/workflows/build-windows.yml"><img alt="build" src="https://github.com/red-tassel-zhang/luyin-stdio/actions/workflows/build-windows.yml/badge.svg"></a>
+  <a href="https://github.com/red-tassel-zhang/luyin-stdio/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/red-tassel-zhang/luyin-stdio?color=3ddc84"></a>
 </p>
 
 一个为 **“录制电脑里正在播放的声音”** 而写的 Windows 桌面录音 / 编辑 / 导出工具。
@@ -38,8 +40,8 @@
 需要 Python 3.10+（开发验证环境为 3.12.4）：
 
 ```bat
-git clone https://github.com/<your-name>/luyin-studio.git
-cd luyin-studio
+git clone https://github.com/red-tassel-zhang/luyin-stdio.git
+cd luyin-stdio
 
 python -m pip install -r requirements.txt
 python fetch_deps.py        :: 下载 vendor\ 里的三个二进制依赖，只需执行一次
@@ -59,7 +61,8 @@ python main.py --selftest
 
 到本仓库的 [Releases](../../releases) 页面下载 `LuyinStudio.exe`，双击即用，无需 Python 与任何依赖。
 首次启动会把运行库解压到临时目录，约需 3–15 秒（视磁盘而定），之后启动更快。
-若 Releases 里还没有，用下面的方式 3 自己打一个。
+最新版是 [v1.0.0](https://github.com/red-tassel-zhang/luyin-stdio/releases/tag/v1.0.0)（由 CI 在 windows-latest 上自动打包）。
+若想自己打一个，见方式 3。
 
 ### 方式 3：自己打包成单文件 exe
 
@@ -156,7 +159,7 @@ python build.py
 ## 七、目录结构
 
 ```
-luyin-studio/
+luyin-stdio/
 ├── main.py                      程序入口（含 --selftest 自检模式）
 ├── luyin/
 │   ├── engine.py                音频引擎：设备枚举、采集、播放、重采样、编解码
