@@ -1,0 +1,9 @@
+# 运行依赖（pip install -r requirements.txt）
+PySide6>=6.5
+numpy>=1.24
+cffi>=1.15
+
+# 说明：
+#   内录 / 播放用的 pyaudiowpatch、MP3 编码用的 lameenc、解码用的 miniaudio
+#   都是自带二进制的小轮子，本仓库不直接收录（见 README「第三方与许可」），
+#   请运行 `python fetch_deps.py` 自动下载并解包到 vendor/ 目录。

@@ -1,0 +1,13 @@
+# 统一换行符：仓库内一律 LF，Windows 上也检出 LF（Python 源码更省心）
+* text=auto eol=lf
+
+# 二进制文件不要做换行/文本处理
+*.png binary
+*.jpg binary
+*.ico binary
+*.pyd binary
+*.so binary
+*.dll binary
+*.exe binary
+*.wav binary
+*.mp3 binary

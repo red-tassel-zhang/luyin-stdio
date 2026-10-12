@@ -1,0 +1,29 @@
+# 打包产物
+build/
+dist/
+*.spec
+app.ico
+
+# 内置第三方库：由 python fetch_deps.py 下载，不入库
+vendor/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 本地调试留下的临时文件
+_tmp/
+_extract/
+_*.log
+_*.txt
+_*.wav
+_*.mp3
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
