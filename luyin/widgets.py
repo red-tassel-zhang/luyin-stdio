@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from PySide6.QtCore import Qt, QPointF, QRectF, Signal
+from PySide6.QtCore import Qt, QLineF, QPointF, QRectF, Signal
 from PySide6.QtGui import (QBrush, QColor, QFont, QLinearGradient, QPainter,
                            QPen, QPolygonF)
 from PySide6.QtWidgets import QSizePolicy, QWidget
@@ -199,16 +199,14 @@ class WaveformView(QWidget):
             return
         mid = rect.center().y()
         half = rect.height() / 2.0 - 1
-        poly = QPolygonF()
-        for i in range(cols):
-            x = rect.left() + i
-            poly.append(QPointF(x, mid - float(mx[i]) * half))
-        for i in range(cols - 1, -1, -1):
-            x = rect.left() + i
-            poly.append(QPointF(x, mid - float(mn[i]) * half))
-        p.setBrush(QBrush(OVERVIEW))
-        p.setPen(Qt.NoPen)
-        p.drawPolygon(poly)
+        # 每列一根竖线（而不是上千顶点的多边形填充）：QPainter 填充这种
+        # 大多边形单次要 90ms 以上，会把采集线程饿死导致丢帧；
+        # 竖线只要 1~2ms，缩略图观感几乎一致。
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(OVERVIEW, 1.0))
+        p.drawLines([QLineF(rect.left() + i, mid - float(mx[i]) * half,
+                            rect.left() + i, mid - float(mn[i]) * half)
+                     for i in range(cols)])
 
         # 当前视图范围
         dur = self.duration()
@@ -301,21 +299,16 @@ class WaveformView(QWidget):
         cmn, cmx = cols_data
         cmn = np.clip(cmn, -1.0, 1.0)
         cmx = np.clip(cmx, -1.0, 1.0)
-        poly = QPolygonF()
-        left = rect.left()
-        for i in range(cols):
-            poly.append(QPointF(left + i, mid - float(cmx[i]) * half))
-        for i in range(cols - 1, -1, -1):
-            poly.append(QPointF(left + i, mid - float(cmn[i]) * half))
         color = CURVE_L if (lanes == 1 or ch == 0) else CURVE_R
-        grad = QLinearGradient(0, rect.top(), 0, rect.bottom())
-        grad.setColorAt(0.0, color.lighter(120))
-        grad.setColorAt(0.5, color)
-        grad.setColorAt(1.0, color.darker(130))
-        p.setBrush(QBrush(grad))
-        p.setPen(QPen(color.darker(150), 1))
-        p.drawPolygon(poly)
+        left = rect.left()
+        # 同缩略图：用逐列竖线代替多边形填充。填充型 drawPolygon 在这里
+        # 单次要 90ms（占满一次重绘的绝大部分），竖线只要 1~2ms；而录音时
+        # 重绘卡住会直接让采集线程丢帧、录音时长偏短。
         p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(color, 1.0))
+        p.drawLines([QLineF(left + i, mid - float(cmx[i]) * half,
+                            left + i, mid - float(cmn[i]) * half)
+                     for i in range(cols)])
 
         # 选区
         if self.sel_end > self.sel_start:

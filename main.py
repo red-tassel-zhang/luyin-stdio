@@ -132,10 +132,20 @@ def selftest() -> int:
         if loop:
             cap.open(loop[0].index, int(loop[0].rate), 2, 1024, 0.0)
             cap.start_recording()
+            # 循环等到真拿到数据为止：启动瞬间声卡可能还没开始投递，
+            # 单次 0.7 秒取样在慢机器上会误报 0 帧。
             import time
-            time.sleep(0.7)
-            blocks = cap.take_blocks()
-            log("captured_frames=%s" % (0 if blocks is None else blocks.shape[0]))
+            t0 = time.perf_counter()
+            blocks = None
+            while time.perf_counter() - t0 < 3.0:
+                time.sleep(0.7)
+                blocks = cap.take_blocks()
+                if blocks is not None:
+                    break
+            log("captured_frames=%s reads=%s max_gap=%.3fs dropped=%s overflows=%s err=%s" % (
+                0 if blocks is None else blocks.shape[0],
+                getattr(cap, "_reads", -1), getattr(cap, "_max_gap", -1.0),
+                cap.dropped, cap.overflows, cap.last_error))
             cap.close()
 
         # MP3 往返

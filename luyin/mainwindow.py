@@ -38,6 +38,7 @@ class MainWindow(QMainWindow):
         self._undo: deque = deque(maxlen=4)
         self._rec_state = None          # None | 'rec' | 'pause'
         self._monitoring = False
+        self._painted_s = 0.0           # 上次重绘波形时的文档时长（限帧用）
         self._play_state = "stopped"    # stopped | playing | paused
         self._pause_pos = 0
         self._play_from = 0.0
@@ -632,6 +633,7 @@ class MainWindow(QMainWindow):
 
     def do_stop(self):
         if self._rec_state:
+            wall = self.capture.wall_seconds
             blocks = self.capture.take_blocks()
             if blocks is not None:
                 self.doc.append(blocks)
@@ -640,6 +642,7 @@ class MainWindow(QMainWindow):
             self.btn_pause.setText("⏸ 暂停")
             self.act_pause_rec.setText("⏸ 暂停录音")
             self.lbl_rec_info.setText("已停止")
+            self.lbl_rec_info.setStyleSheet("")
             self.doc.recorded = True
             self.doc.dirty = True
             self.doc.path = None
@@ -652,10 +655,32 @@ class MainWindow(QMainWindow):
             self.meter_l.reset()
             self.meter_r.reset()
             self._update_title()
+            self._report_rec_lag(wall)
         elif self._play_state != "stopped":
             self._stop_playback()
         elif self._monitoring:
             self.do_monitor_toggle(False)
+
+    def _report_rec_lag(self, wall: float):
+        """录音结束后核对时间轴：驱动丢帧时明确告诉用户，避免导出后才发现偏快。"""
+        if wall <= 1.0:
+            return
+        short = wall - self.doc.seconds
+        if short <= max(0.30, wall * 0.005):
+            return
+        pct = short / wall * 100.0
+        QMessageBox.warning(
+            self, "录音时间轴偏短",
+            "本次录音：真实时间 %s，实际采到 %s，少了 %.2f 秒（%.1f%%）。\n\n"
+            "这是声卡驱动丢帧造成的，导出的文件会比实际快、音调偏高。\n"
+            "可以尝试：\n"
+            "  · 把「缓冲区」调大（例如 2048 / 4096）\n"
+            "  · 关闭占用 CPU 的程序，或改用另一个内录设备\n"
+            "  · 重新录一遍\n\n"
+            "已有的这遍仍然可以保存/导出，只是时长偏短。"
+            % (fmt_time(wall), fmt_time(self.doc.seconds), short, pct))
+        self._set_msg("⚠ 本次录音少了 %.2f 秒（%.1f%%）：驱动丢帧，建议增大缓冲区后重录。"
+                      % (short, pct))
 
     def do_monitor_toggle(self, on: bool):
         on = bool(on)
@@ -765,12 +790,17 @@ class MainWindow(QMainWindow):
             if blocks is not None:
                 self.doc.append(blocks)
             self.lbl_rec_time.setText(fmt_time(self.doc.seconds))
-            self.lbl_rec_info.setText(
-                "正在录音…" if self._rec_state == "rec" else "已暂停")
-            if self.view.follow:
-                self.view.follow_end()
-            else:
-                self.view.update()
+            self._update_rec_info()
+            # 波形限帧：录音时时长每隔 80ms 才重绘一次（约 12fps）。
+            # 波形重绘每次要持有 GIL 若干毫秒，画得太勤会把音频读取线程
+            # 饿死，PortAudio 环形缓冲一溢出就静默丢帧——录到的比实际短、
+            # 导出后像快放。计时器/电平表仍然按 30fps 刷。
+            if self.doc.seconds - self._painted_s >= 0.08 or self.doc.seconds < 0.1:
+                self._painted_s = self.doc.seconds
+                if self.view.follow:
+                    self.view.follow_end()
+                else:
+                    self.view.update()
             self._update_status()
         if self._rec_state or self._monitoring:
             peaks, rmss = self.capture.levels()
@@ -787,6 +817,24 @@ class MainWindow(QMainWindow):
                 self.act_play.setText("▶ 播放 / 暂停")
                 self.view.set_cursor(self._play_from, notify=True)
                 self._set_msg("播放结束")
+
+    def _update_rec_info(self):
+        """录音时把「采到的时长」和「真实经过的时间」摆在一起，丢帧立刻可见。"""
+        if self._rec_state != "rec":
+            self.lbl_rec_info.setText("已暂停")
+            self.lbl_rec_info.setStyleSheet("")
+            return
+        wall = self.capture.wall_seconds
+        drift = self.capture.drift
+        if wall > 1.0 and drift > max(0.30, wall * 0.005):
+            pct = drift / wall * 100.0
+            self.lbl_rec_info.setText(
+                "⚠ 丢帧：已录 %s / 实际 %s（少 %.1f%%）"
+                % (fmt_time(self.doc.seconds), fmt_time(wall), pct))
+            self.lbl_rec_info.setStyleSheet("color:#ffb020;")
+        else:
+            self.lbl_rec_info.setText("正在录音…")
+            self.lbl_rec_info.setStyleSheet("")
 
     # ==================================================================
     # 文件

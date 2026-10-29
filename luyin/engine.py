@@ -308,6 +308,19 @@ class CaptureEngine:
         self.dev_rate = 48000
         self.dev_channels = 2
         self.device_index = -1
+        self._thread: threading.Thread | None = None
+        self._stop_evt = threading.Event()
+        self._blocksize = 1024
+        self.last_error: str | None = None
+        # 时间轴跟踪：用来发现「采到的帧数比真实时间少」这类丢帧
+        self._t_start = 0.0
+        self._t_pause = 0.0
+        self._paused_total = 0.0
+        self.dropped = 0
+        # 读取诊断（_run 里累加，_reset_counters 里清零）
+        self._reads = 0
+        self._last_read_t = 0.0
+        self._max_gap = 0.0
 
     # -- 状态 ------------------------------------------------------------
     @property
@@ -329,6 +342,19 @@ class CaptureEngine:
     @property
     def resampling(self) -> bool:
         return self.dev_rate != self.req_rate
+
+    @property
+    def wall_seconds(self) -> float:
+        """录音开始到现在经过的真实时间（不计暂停）。"""
+        if not self._t_start:
+            return 0.0
+        end = self._t_pause if self._paused else time.perf_counter()
+        return max(0.0, end - self._t_start - self._paused_total)
+
+    @property
+    def drift(self) -> float:
+        """真实时间减采集到的时长：明显为正说明驱动丢了帧。"""
+        return self.wall_seconds - self.seconds
 
     def set_gain_db(self, gain_db: float):
         self._gain = 10.0 ** (float(gain_db) / 20.0)
@@ -355,10 +381,11 @@ class CaptureEngine:
         used = None
         for r, c in attempt:
             try:
+                # 不用 stream_callback：改成专用线程阻塞读取，
+                # 界面卡顿/GC 时数据会堆在 PortAudio 缓冲里而不是被丢掉。
                 stream = self._pa.open(
                     format=pyaudio.paFloat32, channels=c, rate=r, input=True,
-                    input_device_index=device_index, frames_per_buffer=blocksize,
-                    stream_callback=self._callback)
+                    input_device_index=device_index, frames_per_buffer=blocksize)
                 used = (r, c)
                 break
             except Exception as exc:  # 尝试下一个组合
@@ -385,19 +412,40 @@ class CaptureEngine:
         self._stream = stream
         self._recording = False
         self._paused = False
+        self._blocksize = max(64, int(blocksize))
+        self.last_error = None
+        self.dropped = 0
+        self._t_start = 0.0
+        self._t_pause = 0.0
+        self._paused_total = 0.0
         stream.start_stream()
+        self._stop_evt = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="luyin-capture",
+                                        daemon=True)
+        self._thread.start()
 
     def close(self):
-        if self._stream is not None:
+        # 顺序很重要：先让 stop_stream() 把阻塞中的 read() 打断（PortAudio
+        # 允许在其它线程读的时候调用它），再等线程退出，最后才 close()。
+        # 如果反着来——先 join 再 close——读取线程可能正卡在 read() 里，
+        # close() 会把 C 层句柄销毁，进程直接 0xC0000005 崩掉。
+        self._stop_evt.set()
+        thread = self._thread
+        self._thread = None
+        stream = self._stream
+        if stream is not None:
             try:
-                self._stream.stop_stream()
+                stream.stop_stream()
             except Exception:
                 pass
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+        if stream is not None:
             try:
-                self._stream.close()
+                stream.close()
             except Exception:
                 pass
-            self._stream = None
+        self._stream = None
         self._recording = False
         self._paused = False
 
@@ -407,6 +455,10 @@ class CaptureEngine:
             raise AudioError("采集流尚未打开。")
         self.frames = 0
         self.overflows = 0
+        self.dropped = 0
+        self._t_start = time.perf_counter()
+        self._t_pause = 0.0
+        self._paused_total = 0.0
         self._blocks = []
         if self._resampler:
             self._resampler.reset()
@@ -414,12 +466,15 @@ class CaptureEngine:
         self._paused = False
 
     def pause(self):
-        if self._recording:
+        if self._recording and not self._paused:
             self._paused = True
+            self._t_pause = time.perf_counter()
 
     def resume(self):
-        if self._recording:
+        if self._recording and self._paused:
             self._paused = False
+            self._paused_total += time.perf_counter() - self._t_pause
+            self._t_pause = 0.0
 
     def take_blocks(self) -> np.ndarray | None:
         """取出尚未被 GUI 消费的录音数据。"""
@@ -439,36 +494,89 @@ class CaptureEngine:
             self._peak[:] = 0.0
         return peak, rms
 
-    # -- 回调 ------------------------------------------------------------
-    def _callback(self, in_data, frame_count, time_info, status):
-        if status:
-            self.overflows += 1
-        arr = np.frombuffer(in_data, dtype=np.float32)
-        if arr.size:
-            arr = arr.reshape(-1, self.dev_channels)
-            if self._gain != 1.0:
-                arr = arr * self._gain
-            if self._resampler is not None:
-                arr = self._resampler.process(arr)
+    # -- 采集线程 --------------------------------------------------------
+    def _run(self):
+        """阻塞读取线程。
+
+        不用 PortAudio 的实时回调：回调必须在极短时间内返回，界面一忙
+        （波形重绘、Python GC）就会错过截止时间，WASAPI 于是静默丢块——
+        表现就是「录到的比实际时间短、导出后像快放」。改成自己读以后，
+        迟到只是让数据多堆一会儿，不会丢。
+        """
+        ch = self.dev_channels
+        while not self._stop_evt.is_set():
+            stream = self._stream
+            if stream is None:
+                break
+            # 尽量把积压的数据一次读完（上限 8 个块，约 170ms）：
+            # 界面偶尔卡一下时，缓冲里堆着的帧会被一次取走，而不是在
+            # PortAudio 的环形缓冲里被后续帧覆盖掉。
+            want = self._blocksize
+            try:
+                avail = stream.get_read_available()
+            except Exception:
+                avail = 0
+            if avail > want:
+                want = min(avail, self._blocksize * 8)
+            try:
+                raw = stream.read(want, exception_on_overflow=False)
+            except Exception as exc:  # 关流 / 设备拔出
+                if self._stop_evt.is_set():
+                    break
+                self.last_error = "%s: %s" % (type(exc).__name__, exc)
+                self.overflows += 1
+                time.sleep(0.02)
+                continue
+            n = len(raw) // (4 * ch) if raw else 0
+            if n <= 0:
+                continue
+            # 诊断用：读取次数与两次读取之间的最大间隔（间隔越大说明
+            # 采集线程被界面饿得越狠，超过 PortAudio 缓冲就会丢帧）
+            self._reads += 1
+            now = time.perf_counter()
+            if self._last_read_t:
+                gap = now - self._last_read_t
+                if gap > self._max_gap:
+                    self._max_gap = gap
+            self._last_read_t = now
+            if n < want and self._recording and not self._paused:
+                self.dropped += want - n
+            try:
+                self._process_block(np.frombuffer(raw, dtype=np.float32,
+                                                  count=n * ch).reshape(-1, ch))
+            except Exception as exc:
+                # 处理环节出错绝不能带走采集线程（否则整段录音直接空掉）
+                self.last_error = "%s: %s" % (type(exc).__name__, exc)
+                self.overflows += 1
+                time.sleep(0.01)
+
+    def _process_block(self, arr: np.ndarray):
+        if arr.size == 0:
+            return
+        if not np.isfinite(arr).all():          # 设备刚启动时偶尔会吐垃圾
+            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        if self._gain != 1.0:
+            arr = arr * self._gain
+        if self._resampler is not None:
+            arr = self._resampler.process(arr)
             if arr.size == 0:
-                return (None, pyaudio.paContinue)
-            if self.dev_channels != self.req_channels:
-                arr = convert_channels(arr, self.dev_channels, self.req_channels)
-            # 电平表
-            pk = np.abs(arr).max(axis=0)
-            rms = np.sqrt(np.mean(np.square(arr, dtype=np.float32), axis=0))
+                return
+        if self.dev_channels != self.req_channels:
+            arr = convert_channels(arr, self.dev_channels, self.req_channels)
+        pk = np.abs(arr).max(axis=0)
+        # 用 float64 算有效值：float32 平方在异常样本上会溢出刷 RuntimeWarning
+        rms = np.sqrt(np.mean(np.square(arr, dtype=np.float64), axis=0))
+        with self._lock:
+            if arr.shape[1] == 1:
+                self._peak[:] = np.maximum(self._peak, np.repeat(pk, 2))
+                self._rms[:] = np.maximum(self._rms * 0.72, np.repeat(rms, 2))
+            else:
+                self._peak[:] = np.maximum(self._peak, pk[:2])
+                self._rms[:] = np.maximum(self._rms * 0.72, rms[:2])
+        if self._recording and not self._paused:
             with self._lock:
-                if arr.shape[1] == 1:
-                    self._peak[:] = np.maximum(self._peak, np.repeat(pk, 2))
-                    self._rms[:] = np.maximum(self._rms * 0.72, np.repeat(rms, 2))
-                else:
-                    self._peak[:] = np.maximum(self._peak, pk[:2])
-                    self._rms[:] = np.maximum(self._rms * 0.72, rms[:2])
-            if self._recording and not self._paused:
-                with self._lock:
-                    self._blocks.append(arr.copy())
-                    self.frames += arr.shape[0]
-        return (None, pyaudio.paContinue)
+                self._blocks.append(arr.copy())
+                self.frames += arr.shape[0]
 
 
 # --------------------------------------------------------------------------
@@ -846,19 +954,40 @@ def save_mp3(path: str, data: np.ndarray, rate: int, bitrate: int = 192,
 def load_audio(path: str) -> tuple[np.ndarray, int, int]:
     """读取音频文件 -> (float32 [frames, channels], rate, bit_depth)。"""
     if miniaudio is not None:
+        fmt = miniaudio.SampleFormat.FLOAT32
+        info = None
         try:
             info = miniaudio.get_file_info(path)
-            dec = miniaudio.decode_file(
-                path, output_format=miniaudio.SampleFormat.FLOAT32,
-                nchannels=max(1, int(info.nchannels)),
-                sample_rate=int(info.sample_rate))
+        except Exception:
+            info = None
+        rate = int(info.sample_rate) if info is not None else 44100
+        nch = max(1, min(2, int(info.nchannels))) if info is not None else 2
+
+        def finish(dec):
             arr = np.frombuffer(dec.samples, dtype=np.float32)
             ch = max(1, int(dec.nchannels))
             arr = arr.reshape(-1, ch).copy()
             np.clip(arr, -1.0, 1.0, out=arr)
             return arr, int(dec.sample_rate), 32
-        except Exception as exc:
-            raise AudioError("无法解码文件：\n%s\n（%s）" % (path, exc))
+
+        try:
+            dec = miniaudio.decode_file(path, output_format=fmt, nchannels=nch,
+                                        sample_rate=rate)
+            return finish(dec)
+        except Exception as exc_first:
+            # 中文等非 ASCII 路径：ma_decode_file 用的是 ANSI 窄字符文件接口，
+            # 传 UTF-8 路径会直接失败（DecodeError -7）；而 get_file_info 走的是
+            # 宽字符接口，所以路径本身是好的。这里改成读进内存用 decode() 解，
+            # 完全绕开文件名字符集问题。
+            try:
+                with open(path, "rb") as f:
+                    blob = f.read()
+                dec = miniaudio.decode(blob, output_format=fmt, nchannels=nch,
+                                       sample_rate=rate)
+                return finish(dec)
+            except Exception as exc_second:
+                raise AudioError("无法解码文件：\n%s\n（%s / %s）"
+                                 % (path, exc_first, exc_second))
     # 兜底：仅 WAV
     import wave
     with wave.open(path, "rb") as w:
